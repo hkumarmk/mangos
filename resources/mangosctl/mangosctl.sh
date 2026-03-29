@@ -6,50 +6,76 @@ DEFAULT_DATACENTER=dc1
 set -e
 
 usage() {
-	echo 'Usage: $0 [GLOBAL OPTIONS] {install|update|enroll}'
-	echo
-	echo '  install          - install Mangos on this machine'
-	echo '  updatectl        - update an existing Mangos installation'
-	echo '  enroll           - generate a private key and CSR for this machine'
-	echo '  addext EXTENSION - pull and merge an extension (e.g. \"debug\")'
-	echo '  bootstrap        - bootstrap a Mangos installation'
-	echo '  vault	         - run vault CLI against local vault instance'
-	echo '  nomad	         - run nomad CLI against local nomad instance'
-	echo ''
-	echo 'Global options:'
-	echo '  -b, --base-url=URL       Base URL to download Mangos components from'
-	echo '  -c, --ca-cert=FILE       CA certificate to use when interacting with Mangos cluster'
-	echo '  -v, --version=VERSION    Version of Mangos to assume. Default is $IMAGE_VERSION /etc/os-release'
-	echo ''
-	echo 'SUBCOMMANDS'
-	echo ''
-	echo '  mangosctl [OPTS] bootstrap [-r|--region REGION] [--datacenter DATACENTER] [--clean]'
-	echo ''
-	echo 'Bootstraps a new Mangos cluster on this node.'
-	echo ''
-	echo '  -r, --region=REGION          Set the region for the mangos installation (default: global)'
-	echo '  -d, --datacenter=DATACENTER  Set the datacenter for the mangos installation (default: dc1)'
-	echo '  --clean                      Clean up any existing mangos installation before bootstrapping'
-	echo ''
-	echo '  mangosctl [OPTS] enroll [-gGROUP|--group GROUP] [-r|--region REGION] [--datacenter DATACENTER]'
-	echo ''
-	echo 'Options for enroll:'
-	echo '  -gGROUP, --group=GROUP        Add this node to GROUP (can be specified multiple times)'
-	echo '  -rREGION, --region=REGION     Specify the region for this node'
-	echo '  -dDATACENTER, --dc=DATACENTER Specify the datacenter for this node'
-	echo ''
-	echo 'Examples:'
-	echo ''
-	echo '  Bootstrap cluster and enroll node:'
-	echo ''
-	echo '    mangosctl bootstrap -r us-west1 -d dc1'
-	echo '    mangosctl enroll    -r us-west1 -d dc1 -g{vault-server,{nomad,consul}-{server,client}}s 127.0.0.1'
-	echo ''
+	cat <<'EOF'
+Usage: mangosctl [GLOBAL OPTIONS] {install|updatectl|enroll}
+
+  bootstrap        - bootstrap a Mangos installation
+  enroll           - generate a private key and CSR for this machine
+  updatectl        - update an existing Mangos installation
+
+Global options:
+  -b, --base-url=URL       Base URL to download Mangos components from.
+  -c, --ca-cert=FILE       CA certificate to use when interacting with Mangos cluster
+  -v, --version=VERSION    Version of Mangos to assume. Default is $IMAGE_VERSION /etc/os-release
+
+SUBCOMMANDS
+
+  SYNOPSIS
+  
+  mangosctl [OPTS] bootstrap [-r|--region REGION] [--datacenter DATACENTER] [--clean]
+
+  PURPOSE
+  
+  Bootstraps a new Mangos cluster on this node.
+
+  OPTIONS:
+    -r, --region=REGION          Set the region for the mangos installation (default: global)
+    -d, --datacenter=DATACENTER  Set the datacenter for the mangos installation (default: dc1)
+    --clean                      Clean up any existing mangos installation before bootstrapping
+
+-----------------------------------------------------------------------------------------------
+
+  SYNOPSIS
+  
+  mangosctl [OPTS] enroll [-gGROUP|--group GROUP] [-r|--region REGION] [--datacenter DATACENTER]
+  
+  Enrolls this node into an existing Mangos cluster.
+
+  OPTIONS:
+    -gGROUP, --group=GROUP        Add this node to GROUP (can be specified multiple times)
+    -rREGION, --region=REGION     Specify the region for this node
+    -dDATACENTER, --dc=DATACENTER Specify the datacenter for this node
+
+  Examples:
+
+    Bootstrap cluster and enroll node:
+
+      mangosctl bootstrap -r us-west1 -d dc1
+      mangosctl enroll    -r us-west1 -d dc1 -g{vault-server,{nomad,consul}-{server,client}}s 127.0.0.1
+
+-----------------------------------------------------------------------------------------------
+
+  SYNOPSIS
+  
+  mangosctl [OPTS] updatectl <subsubcommand>
+
+  Keep Mangos system up-to-date
+  
+  Subcommands:
+    mangosctl updatectl enable-verification  Enable verification of updates
+    mangosctl updatectl disable-verification Disable verification of updates
+    mangosctl updatectl enable FEATURE       Enable a sysupdate feature
+    mangosctl updatectl disable FEATURE      Disable a sysupdate feature
+    mangosctl updatectl ARGS...              Call `updatectl ARGS...`, refresh sysext and
+                                             confext afterwards
+
+  
+EOF
 	exit 1
 }
 
 main() {
-	args="$(getopt -o '+b:c:v:' --long 'base-url:ca-cert:version:' -n 'mangosctl' -- "$@")"
+	args="$(getopt -o '+b:c:v:' --long 'base-url:,ca-cert:,version:' -n 'mangosctl' -- "$@")"
 	if [ $? != 0 ]
 	then
 		echo "Error parsing arguments" >&2
@@ -294,6 +320,95 @@ do_install() {
 	fi
 }
 
+# Enroll recovery keys for encrypted partitions and store them in Vault
+enroll_recovery_keys() {
+	local vault_token="$1"
+	local machine_id="$(cat /etc/machine-id)"
+	local found_any=0
+
+	local marker_dir="/var/lib/mangos/luks-recovery-keys-enrolled"
+	mkdir -p "${marker_dir}"
+
+	# Find all LUKS-encrypted partitions
+	local devices="$(lsblk -ln -o NAME,TYPE,FSTYPE | awk '$2=="part" && $3=="crypto_LUKS" {print "/dev/"$1}' | tr '\n' ' ')"
+
+	echo "> LUKS-encrypted devices found: $devices"
+
+	for device in ${devices}; do
+		echo "> Processing device: ${device}"
+		local partlabel="$(lsblk -n -o PARTLABEL "${device}" 2>/dev/null | tr -d ' \n\r\t')"
+
+		# Skip if no valid partition label
+		if [ -z "${partlabel}" ]; then
+			echo "> Device ${device} has no PARTLABEL, skipping"
+			continue
+		fi
+
+		# Skip if already enrolled
+		local marker_file="${marker_dir}/${partlabel}"
+		if [ -f "${marker_file}" ]; then
+			echo "> Recovery key for ${partlabel} already enrolled, skipping"
+			continue
+		fi
+
+		found_any=1
+		step "Enrolling recovery key for ${partlabel}"
+
+		# Generate and enroll recovery key (systemd-cryptenroll generates and prints the key)
+		# Use TPM to unlock the device, then enroll a new recovery key
+		local output=$(systemd-cryptenroll "${device}" --recovery-key --unlock-tpm2-device=auto 2>&1)
+
+		# Extract recovery key - format: 6 lowercase alphanumeric groups of 8, separated by dashes
+		# Example: etklvner-lblhnbgl-kdtnujtk-ikjlgbur-lnlrjrrc-iuikkidg-feientnn-dkjeeuft
+		LUKS_RECOVERY_KEY_REGEX='[a-z0-9]{8}(-[a-z0-9]{8}){7}'
+		local recovery_key="$(echo "$output" | grep -oE "${LUKS_RECOVERY_KEY_REGEX}" | head -n 1)"
+
+		if [ -n "${recovery_key}" ]; then
+			if VAULT_TOKEN="${vault_token}" vault kv put "secrets/mangos/recovery-keys/${machine_id}/${partlabel}" \
+				key="${recovery_key}" hostname="${HOSTNAME}" device="${device}" created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+			then
+				greenln Success
+				touch "${marker_file}"
+			else
+				red "Failed to store in Vault"
+			fi
+		else
+			red "Failed to extract recovery key. cryptenroll output:"
+			echo "${output}"
+		fi
+	done
+
+	if [ ${found_any} -eq 0 ]; then
+		echo "> All recovery keys already enrolled"
+	else
+		echo "> Recovery keys enrolled and stored in Vault"
+	fi
+}
+
+write_machine_id_metadata() {
+	step "Getting mount accessor for node-cert"
+	node_auth_accessor="$(vault read -field=accessor sys/auth/node-cert)"
+
+	step "Looking up entity name for this node"
+	entity_name="$(vault write -field=name identity/lookup/entity alias_name=${HOSTNAME}.mangos alias_mount_accessor=${node_auth_accessor})"
+
+	step "Setting machine-id as entity metadata"
+	machine_id="$(cat /etc/machine-id)"
+
+	# Read current metadata, merge with new machine_id, and write back
+	current_metadata="$(vault read -format=json identity/entity/name/${entity_name} | jq -r '.data.metadata // {}')"
+	new_metadata="$(echo "${current_metadata}" | jq --arg mid "${machine_id}" '. + {machine_id: $mid}')"
+
+	# Convert JSON to key=value arguments for Vault CLI
+	metadata_args=()
+	while IFS='=' read -r k v; do
+		metadata_args+=("metadata=${k}=${v}")
+	done < <(echo "${new_metadata}" | jq -r 'to_entries|map("\(.key)=\(.value|tostring)")|.[]')
+
+	vault write identity/entity/name/"${entity_name}" "${metadata_args[@]}"
+	greenln Success
+}
+
 do_enroll() {
 	declare -A groups
 
@@ -307,7 +422,7 @@ do_enroll() {
 		DATACENTER="$(. /etc/environment.d/20-mangos.conf ; echo ${NOMAD_DATACENTER})"
 	fi
 
-	args="$(getopt -o 'g:r:d:' --long 'group:region:dc:datacenter:' -n 'mangosctl enroll' -- "$@")"
+	args="$(getopt -o 'g:r:d:' --long 'group:,region:,dc:,datacenter:' -n 'mangosctl enroll' -- "$@")"
 	if [ $? != 0 ]
 	then
 		echo "Error parsing arguments" >&2
@@ -399,13 +514,7 @@ do_enroll() {
 	NODE_VAULT_TOKEN=$(vault login -method=cert -path=node-cert -client-cert=/var/lib/mangos/mangos.crt -client-key=<(systemd-creds decrypt ${confext_dir}/etc/credstore.encrypted/mangos.key) -token-only)
 	greenln Success
 
-	step "Getting mount accessor for node-cert"
-	node_auth_accessor=$(vault read -field=accessor sys/auth/node-cert)
-	echo $node_auth_accessor
-
-	step "Looking up entity name for this node"
-	entity_name=$(vault write -field=name identity/lookup/entity alias_name=${HOSTNAME}.mangos alias_mount_accessor=${node_auth_accessor})
-	echo $entity_name
+	do_step "Writing machine ID metadata to Vault" write_machine_id_metadata
 
 	for group in ${!groups[@]}
 	do
@@ -519,14 +628,16 @@ do_enroll() {
 		greenln Success
 	fi
 
-	do_step "Reloading confexts" chronic systemd-confext refresh
+	do_step "Reloading confexts" chronic systemd-confext refresh --mutable=auto
 
 	step "Merging /etc/environment.d/20-mangos.conf into /etc/environment"
 	cat /etc/environment /etc/environment.d/20-mangos.conf | sort -u > ${confext_dir}/etc/environment.new
 	mv ${confext_dir}/etc/environment.new ${confext_dir}/etc/environment
 	greenln Success
 
-	do_step "Reloading confexts" chronic systemd-confext refresh
+	do_step "Reloading confexts" chronic systemd-confext refresh --mutable=auto
+
+	do_step "Enrolling recovery keys for encrypted partitions" enroll_recovery_keys "${NODE_VAULT_TOKEN}"
 }
 
 do_group() {
@@ -571,7 +682,7 @@ do_entity() {
 	esac
 }
 
-enable_sysupdate_extension() {
+enable_sysupdate_feature() {
 	for feature in "$@"
 	do
 		mkdir -p "/run/sysupdate.d/${feature}.feature.d"
@@ -580,52 +691,44 @@ enable_sysupdate_extension() {
 }
 
 do_updatectl() {
-	if [ "$1" = "enable" ]
-	then
-		shift
-		enable_sysupdate_extension "$@"
-		return
-	fi
-	for d in /usr/lib/sysupdate*.d/*.transfer
-	do
-		mkdir -p "/run/${d#/usr/lib/}.d"
-		cat <<EOF >> "/run/${d#/usr/lib/}.d/override.conf"
-[Source]
-Path=${BASE_URL}
-[Transfer]
-Verify=no
-EOF
-	done
-
-	args="$(getopt -o 'c:' --long 'component:' -n 'mangosctl update' -- "$@")"
-	if [ $? != 0 ]
-	then
-		echo "Error parsing arguments" >&2
-		usage
-	fi
-
-	eval set -- "${args}"
-	while true
-	do
-		case "$1" in
-			-c|--component)
-				defs="${tmpdir}/sysupdate.${2}.d"
-				shift 2
-				;;
-			--)
-				shift
-				break
-				;;
-			*)
-				echo "Error parsing arguments" >&2
-				usage
-				;;
-		esac
-	done
+	case "$1" in
+		enable)
+			shift
+			enable_sysupdate_feature "$@"
+			return
+			;;
+		disable-verification)
+			for d in /usr/lib/sysupdate*.d/*.transfer
+			do
+				mkdir -p "/run/${d#/usr/lib/}.d"
+				cat <<-EOF > "/run/${d#/usr/lib/}.d/no-verify.conf"
+				[Transfer]
+				Verify=no
+				EOF
+			done
+			return
+			;;
+		add-overrides)
+			for d in /usr/lib/sysupdate*.d/*.transfer
+			do
+				mkdir -p "/run/${d#/usr/lib/}.d"
+				cat <<-EOF > "/run/${d#/usr/lib/}.d/source-path-override.conf"
+				[Source]
+				Path=${BASE_URL}/sysupdate$(grep 'Path=http:' ${d} | sed -e 's%\(.*\)/sysupdate%%g')
+				EOF
+			done
+			return
+			;;
+		enable-verification)
+			rm -f /run/sysupdate*.d/*.transfer.d/no-verify.conf
+			return
+			;;
+	esac
 
 	updatectl "$@"
-	systemd-sysext refresh
-	systemd-confext refresh
+
+	systemd-sysext refresh --mutable=auto
+	systemd-confext refresh --mutable=auto
 	systemctl daemon-reload
 
 	if is_efi
@@ -746,7 +849,7 @@ do_bootstrap() {
 	green Done
 	echo 
 
-	do_step "Merging Hashistack sysext" chronic systemd-sysext refresh
+	do_step "Merging Hashistack sysext" chronic systemd-sysext refresh --mutable=auto
 
 	do_step "Reloading systemd" systemctl daemon-reload
 
@@ -821,7 +924,7 @@ do_bootstrap() {
 		-config /usr/share/consul-template/conf/nomad-certs.hcl
 	EOF
 
-	do_step "Refreshing confexts" chronic systemd-confext refresh
+	do_step "Refreshing confexts" chronic systemd-confext refresh --mutable=auto
 
 	do_step "Restarting Vault in non-bootstrap mode" chronic systemctl start vault
 
@@ -842,7 +945,7 @@ do_bootstrap() {
 		-retry-join 127.0.0.1 \
 		-config-dir=/usr/share/consul/ \
 		-datacenter "${REGION}-${DATACENTER}" \
-		-config-file=${enckey} -bootstrap
+		-config-file=${enckey} -bootstrap -server
 
 	mkdir -p ${confext_dir}/etc/environment.d
 	echo CONSUL_DATACENTER=${REGION}-${DATACENTER} >> ${confext_dir}/etc/environment.d/20-mangos.conf
@@ -869,7 +972,7 @@ do_bootstrap() {
 	systemd-creds -H encrypt - ${confext_dir}/etc/credstore.encrypted/consul.agent_recovery <<<${agent_recovery_token}
 	greenln Success
 
-	do_step "Reloading confexts" chronic systemd-confext refresh
+	do_step "Reloading confexts" chronic systemd-confext refresh --mutable=auto
 
 	do_step "Launching Consul in non-bootstrap mode" chronic systemctl start consul
 
@@ -898,7 +1001,7 @@ do_bootstrap() {
 
 	echo VAULT_ADDR=https://vault.service.consul:8200 >> ${confext_dir}/etc/environment.d/20-mangos.conf
 
-	do_step "Reloading confexts" chronic systemd-confext refresh
+	do_step "Reloading confexts" chronic systemd-confext refresh --mutable=auto
 	do_step "Restarting Vault" chronic systemctl restart vault
 
 	step "Creating Consul token for Nomad server"
@@ -911,7 +1014,7 @@ do_bootstrap() {
                         -format=json | jq .SecretID -r | systemd-creds -H encrypt - ${confext_dir}/etc/credstore.encrypted/nomad.consul_token
 	greenln Success
 
-	do_step "Reloading confexts" chronic systemd-confext refresh
+	do_step "Reloading confexts" chronic systemd-confext refresh --mutable=auto
 
 	mkdir -p /run/nomad
 	systemd-creds decrypt ${confext_dir}/etc/credstore.encrypted/nomad.consul_token | jq -R '{consul:{token:.}}' > /run/nomad/consul-agent.json
@@ -950,7 +1053,7 @@ do_bootstrap() {
 	export NOMAD_ADDR=https://nomad.service.consul:4646
 	export NOMAD_CACERT=/var/lib/nomad/ssl/ca.pem
 
-	do_step "Reloading confexts" chronic systemd-confext refresh
+	do_step "Reloading confexts" chronic systemd-confext refresh --mutable=auto
 
 	do_step "Bootstrapping Nomad via Vault" chronic run_terraform_apply -target=vault_nomad_secret_role.management #vault_nomad_secret_backend.nomad
 
@@ -968,7 +1071,13 @@ do_bootstrap() {
 	nomad_mgmt_token="$(VAULT_TOKEN=$(systemd-creds decrypt /var/lib/private/vault.root_token) vault read -field=secret_id nomad/creds/management)"
 	NOMAD_TOKEN="${nomad_mgmt_token}" \
 	CONSUL_HTTP_TOKEN=${consul_mgmt_token} \
-	do_step "Final Terraform run" chronic run_terraform_apply
+	do_step "Final Terraform run" run_terraform_apply
+
+	echo
+	echo "Bootstrap complete! Next steps:"
+	echo "  1. Run: mangosctl sudo enroll -g vault-server -g consul-server -g nomad-server 127.0.0.1"
+	echo "  2. This will enroll the bootstrap node's identity and recovery keys"
+	echo
 }
 
 set_agent_token() {
@@ -1028,7 +1137,7 @@ do_addext() {
 	fi
 
 	wget --progress=dot:giga -O /var/lib/extensions/"${image_file_name}" "${BASE_URL}/${image_file_name}"
-	systemd-sysext refresh
+	systemd-sysext refresh --mutable=auto
 }
 
 if [ "$1" = "sudo" ]

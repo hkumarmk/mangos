@@ -127,16 +127,25 @@ resource "vault_pki_secret_backend_issuer" "nodes-intermediate" {
 }
 
 resource "vault_pki_secret_backend_role" "node-cert" {
-  backend            = vault_mount.pki-nodes.path
-  name               = "node-cert"
-  ttl                = var.node-cert-issuer-period
-  issuer_ref         = vault_pki_secret_backend_issuer.nodes-intermediate.issuer_ref
+  backend             = vault_mount.pki-nodes.path
+  name                = "node-cert"
+  ttl                 = var.node-cert-issuer-period
+  issuer_ref          = vault_pki_secret_backend_issuer.nodes-intermediate.issuer_ref
   use_csr_common_name = false
-  allow_bare_domains = false
-  allow_subdomains   = true
-  allowed_domains = flatten([
+  allow_bare_domains  = false
+  allow_subdomains    = true
+  allowed_domains     = flatten([
     "mangos",
   ])
+}
+
+resource "vault_policy" "node-cert-signer" {
+  name   = "node-cert-signer"
+  policy = <<-EOP
+    path "${vault_pki_secret_backend_role.node-cert.backend}/sign/${vault_pki_secret_backend_role.node-cert.name}" {
+      capabilities = ["update"]
+    }
+    EOP
 }
 
 resource "vault_pki_secret_backend_role" "node-cert-self" {
@@ -235,6 +244,15 @@ resource "vault_auth_backend" "node-cert" {
     type = "cert"
 }
 
+resource "vault_policy" "sys-auth-node-cert-reader" {
+  name   = "sys-auth-node-cert-reader"
+  policy = <<-EOP
+    path "sys/mounts/auth/${vault_auth_backend.node-cert.path}" {
+      capabilities = ["read"]
+    }
+    EOP
+}
+
 resource "vault_cert_auth_backend_role" "node" {
     name           = "node"
     certificate    = local.nodes-ca
@@ -244,7 +262,9 @@ resource "vault_cert_auth_backend_role" "node" {
     token_policies = [
       vault_policy.lookup-self.name,
       vault_policy.node-cert-self-renew.name,
+      vault_policy.ssh-host-self-signer.name,
       vault_policy.consul-gossip.name,
+      vault_policy.node-recovery-keys.name,
     ]
 }
 
@@ -254,6 +274,22 @@ resource "vault_policy" "node-cert-self-renew" {
     policy = <<-EOP
         path "${vault_mount.pki-nodes.path}/sign/node-cert-self" {
             capabilities = ["update"]
+        }
+    EOP
+}
+
+resource "vault_policy" "node-recovery-keys" {
+    name = "node-recovery-keys"
+
+    policy = <<-EOP
+        # Allow nodes to create recovery keys for their own machine-id only (write-once, no read/update)
+        # No read allowed because node does not need to read its own recovery key,
+        #   it is only needed to be read by admins to recover the node
+        # No update allowed to avoid compromised node may update recovery key
+        #  Any update of recovery keys (even for rotating recovery keys) need admin actions
+        #  For which admin key should be used
+        path "secrets/mangos/recovery-keys/{{identity.entity.metadata.machine_id}}/*" {
+            capabilities = ["create"]
         }
     EOP
 }
@@ -309,6 +345,15 @@ resource "vault_identity_group" "nomad-clients" {
   }
 }
 
+resource "vault_policy" "vault-identity-group-nomad-clients-rw" {
+  name   = "vault-identity-group-nomad-clients-rw"
+  policy = <<-EOP
+    path "identity/group/name/${vault_identity_group.nomad-clients.name}" {
+      capabilities = ["read", "update"]
+    }
+    EOP
+}
+
 resource "vault_policy" "nomad-client-issuer" {
   name   = "nomad-client-issuer"
   policy = <<-EOP
@@ -348,6 +393,16 @@ resource "vault_identity_group" "consul-clients" {
     ignore_changes = [member_entity_ids]
   }
 }
+
+resource "vault_policy" "vault-identity-group-consul-clients-rw" {
+  name   = "vault-identity-group-consul-clients-rw"
+  policy = <<-EOP
+    path "identity/group/name/${vault_identity_group.consul-clients.name}" {
+      capabilities = ["read", "update"]
+    }
+    EOP
+}
+
 
 resource "vault_policy" "consul-client-issuer" {
   name   = "consul-client-issuer"
